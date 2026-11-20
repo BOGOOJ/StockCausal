@@ -185,8 +185,26 @@ def analyze(feature, label, values, fwd, split_date=None, event_only=False):
         result[scope] = {"cells": cells, "spread": spread, "best": best,
                          "ic": ic_mean, "ic_days": len(ics)}
     o = result["out"]
+    cells = o["cells"]
+    # 判定要比「跨档差>0.1pp」严得多，否则 U 形噪声也会被判成通过：
+    # ① 单调性：档位与超额收益的秩相关 |rho| >= 0.8
+    # ② 极端档的 |t| >= 2
+    # ③ 每档样本 >= 100
+    rho = None
+    monotone = False
+    extreme_t = 0.0
+    min_n = 0
+    if len(cells) == A.BUCKETS:
+        rho = A.spearman(list(range(len(cells))), [c["mean_excess"] or 0 for c in cells])
+        monotone = rho is not None and abs(rho) >= 0.8
+        extreme_t = max(abs(cells[0]["t"] or 0), abs(cells[-1]["t"] or 0))
+        min_n = min(c["n"] for c in cells)
     passed = (o["spread"] is not None and abs(o["spread"]) > A.SPREAD_MIN
-              and o["best"] and (o["best"]["net"] or -1) > 0)
+              and o["best"] and (o["best"]["net"] or -1) > 0
+              and monotone and extreme_t >= 2.0 and min_n >= 100)
+    result["mono_rho"] = rho
+    result["extreme_t"] = extreme_t
+    result["min_n"] = min_n
     result["verdict"] = "PASS" if passed else "FAIL"
     return result
 
@@ -202,6 +220,11 @@ def save(results, info):
         else:
             reason.append("样本外跨档差 %+.3fpp，最优档（第%d档）扣成本后 %+.3fpp"
                           % (o["spread"] * 100, o["best"]["bucket"], (o["best"]["net"] or 0) * 100))
+            reason.append("单调性 |rho|=%s（需≥0.8）：%s"
+                          % ("—" if res["mono_rho"] is None else "%.2f" % abs(res["mono_rho"]),
+                             "通过" if res["mono_rho"] is not None and abs(res["mono_rho"]) >= 0.8 else "不通过"))
+            reason.append("极端档 |t|=%.2f（需≥2）；最小档样本 %d（需≥100）"
+                          % (res["extreme_t"], res["min_n"]))
             reason.append("样本外 IC %s（%d 天）"
                           % ("—" if o["ic"] is None else "%.4f" % o["ic"], o["ic_days"]))
         cur = conn.execute(
