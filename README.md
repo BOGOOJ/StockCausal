@@ -37,6 +37,10 @@ python scripts\main.py backfill --days 30
 
 :: 5) 重新按规则生成研究样本池
 python scripts\pick_watchlist.py
+
+:: 6) 跑分析：过去 k 天涨跌 → 次日收益
+python scripts\analyze.py            :: 跑一次，出报告 + 记账
+python scripts\analyze.py --report   :: 看历史实验清单
 ```
 
 需要 Python 3.10+。除了**导出 Excel** 会自动装 `openpyxl`，其余全部用标准库。
@@ -138,6 +142,16 @@ out\<代码>_日线.csv           单只行情导出
 
 ---
 
+## 第一份分析结果（2026-11-20）
+
+用 30 只样本股 + 2 个指数、2023-11-21 至 2026-11-19 的日线跑「过去 k 天涨跌 → 次日收益」：
+
+> **结论：FAIL。** 样本外 6 个窗口里只有 k=1 过了判定线，跨档差 0.18pp，最优档扣掉 0.15% 成本后只剩 **+0.017pp**（1 万仓位约 1.7 元/次）。其余窗口扣成本后全为负。
+
+这不是脚本坏了，是**日频方向预测在这批样本上没有可利用的效应**。完整表格见 `reports/分析_*.md`。
+
+---
+
 ## 想了解内部实现
 
 见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**：数据流图、每个脚本的职责与调用关系、关键设计决策和理由、用到的全部外部接口（含踩过的坑）、表结构、失败处理、怎么扩展。
@@ -157,6 +171,7 @@ scripts/
   store.py             CSV 按日整段替换 + 行数守卫
   kline.py             日线库（同花顺 all.js → SQLite）
   pick_watchlist.py    按机械规则生成样本池
+  analyze.py           条件收益统计（过去 k 天涨跌 → 次日收益）
   report.py            Excel 导出
   main.py              命令行入口
 data/  out/  logs/     运行产物（不入库）

@@ -11,6 +11,7 @@ data/_bak/
 
 logs/
 out/
+reports/
 *.tmp
 .DS_Store
 Thumbs.db
