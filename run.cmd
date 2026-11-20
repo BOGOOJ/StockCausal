@@ -5,7 +5,7 @@ cd /d "%~dp0"
 call "%~dp0_find-python.cmd"
 if not defined PY exit /b 1
 echo ============================================
-echo  ths-daily : grab today + export excel
+echo  StockCausual : grab today + export excel
 echo ============================================
 "%PY%" "%~dp0scripts\main.py" daily
 echo.

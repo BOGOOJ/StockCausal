@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-schtasks /Delete /TN "ths-daily" /F
+schtasks /Delete /TN "StockCausual" /F
 if errorlevel 1 (
-  echo [INFO] Task "ths-daily" not found.
+  echo [INFO] Task "StockCausual" not found.
 ) else (
-  echo [OK] Task "ths-daily" removed.
+  echo [OK] Task "StockCausual" removed.
 )
 echo.
 pause
