@@ -160,7 +160,9 @@ def update_one(conn, raw_code, start_date, log=print):
     code = normalize(raw_code)
     if not re.fullmatch(r"[0-9A-Za-z]{4,8}", code):
         return False, "代码格式不对：%s" % raw_code
-    segs = ("01", "00", "02") if is_index(code) else ("00", "01", "02")
+    # 指数没有分红除权，01(前复权) 就是原始值；股票只能用 00(不复权)，
+    # 绝不能回退到 01——前复权对老股票会变成负数/被缩放，和「不复权」混在一起就废了。
+    segs = ("01", "00") if is_index(code) else ("00",)
     source = "同花顺"
     try:
         rows, seg = fetch_ths(code, segs)
@@ -184,6 +186,13 @@ def update_one(conn, raw_code, start_date, log=print):
     if source == "同花顺" and not is_index(code):
         try:
             adj_rows, _ = fetch_ths(code, ("02",))
+            adj_map = {r["日期"]: r["收盘"] for r in adj_rows}
+        except Exception:
+            adj_map = {}
+    if not is_index(code) and not adj_map:
+        # 同花顺后复权取不到时用东财兜底：只补一列收盘价，请求量很小
+        try:
+            adj_rows = fetch_em.kline(fetch_em.secid(code), fqt=2)
             adj_map = {r["日期"]: r["收盘"] for r in adj_rows}
         except Exception:
             adj_map = {}
