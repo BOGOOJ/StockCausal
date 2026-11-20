@@ -56,6 +56,10 @@
 | `report.py` | 把当日 CSV 合成 Excel | `build_daily` | CSV → xlsx |
 | `main.py` | 命令行入口、流程编排、摘要输出 | `run` / `backfill` / `verify` | 参数 → 落库 + 摘要 |
 | `analyze.py` | 条件收益统计（过去 k 天涨跌 → 次日收益） | `build_panel` / `analyze_scope` / `judge` | kline.db → 报告 + experiments.db |
+| `backfill.py` | 批量回补历史事件数据（只走东财+上交所，断点续传） | `trading_days` / `do_*` | 日期区间 → CSV |
+| `features.py` | 把资金数据算成 6 个指标 | `margin_features` / `longhu_features` / `block_features` | CSV → features.csv |
+| `analyze_features.py` | 资金指标 → 次日超额收益 | `analyze` / `save` | features.csv + kline.db → 报告 + 台账 |
+| `status.py` | 随时看数据攒到哪了（不联网） | `scan` / `render` | 本地文件 → 终端表格 |
 
 ### 调用关系
 
