@@ -138,10 +138,17 @@ out\<代码>_日线.csv           单只行情导出
 
 ---
 
+## 想了解内部实现
+
+见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**：数据流图、每个脚本的职责与调用关系、关键设计决策和理由、用到的全部外部接口（含踩过的坑）、表结构、失败处理、怎么扩展。
+
+---
+
 ## 目录结构
 
 ```
 watchlist.txt          研究样本池 / 自选池（一行一个代码）
+docs/ARCHITECTURE.md   代码逻辑：数据流、模块职责、设计决策、外部接口
 scripts/
   net.py               请求层（绕系统代理、限速、502 重试）
   parse_ths.py         同花顺数据中心页面解析
