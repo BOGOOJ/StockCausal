@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 抓下来的数据不入库（每个人自己跑就有）
+data/*.csv
+data/*.db
+data/raw/
+data/_bak/
+!data/.gitkeep
+
+logs/
+out/
+*.tmp
+.DS_Store
+Thumbs.db
