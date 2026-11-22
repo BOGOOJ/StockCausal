@@ -26,6 +26,7 @@ THS_REF = "http://stockpage.10jqka.com.cn/%s/"
 JSONP = re.compile(r"\((.*)\)\s*$", re.S)
 
 INDEX_PREFIX = ("1A", "1B", "399")
+INDEX_CODE = "1A0001"      # 上证指数，用来当交易日后缀的参照
 
 # 指数在同花顺和东财的代码不一样，备用源要映射一下
 INDEX_EM = {
@@ -156,10 +157,14 @@ def guard_today(rows):
     return rows
 
 
-def update_one(conn, raw_code, start_date, log=print):
+def update_one(conn, raw_code, start_date, log=print, latest=None, force=False):
     code = normalize(raw_code)
     if not re.fullmatch(r"[0-9A-Za-z]{4,8}", code):
         return False, "代码格式不对：%s" % raw_code
+    if latest and not force:
+        have = conn.execute("SELECT MAX(date) FROM kline WHERE code=?", (code,)).fetchone()[0]
+        if have and have >= latest:
+            return True, "%s 已到 %s，跳过（--force 可强制重下）" % (code, have)
     # 指数没有分红除权，01(前复权) 就是原始值；股票只能用 00(不复权)，
     # 绝不能回退到 01——前复权对老股票会变成负数/被缩放，和「不复权」混在一起就废了。
     segs = ("01", "00") if is_index(code) else ("00",)
@@ -273,6 +278,7 @@ def main(argv):
     parser.add_argument("--from", dest="date_from", default="", help="导出起始日期")
     parser.add_argument("--to", dest="date_to", default="", help="导出结束日期")
     parser.add_argument("--list", action="store_true", help="列出库里已有的代码")
+    parser.add_argument("--force", action="store_true", help="已是最新也强制重下")
     args = parser.parse_args(argv)
 
     conn = connect()
@@ -317,10 +323,14 @@ def main(argv):
         return 2
 
     print("共 %d 个标的，只保留 %s 之后的数据" % (len(targets), start_date))
+    latest = conn.execute("SELECT MAX(date) FROM kline WHERE code=?", (INDEX_CODE,)).fetchone()[0]
+    if latest:
+        print("库里的最新交易日：%s（已最新的标的自动跳过）" % latest)
     ok, failed = 0, []
     for i, code in enumerate(targets, 1):
         try:
-            good, message = update_one(conn, code, start_date, log=lambda m: print(m))
+            good, message = update_one(conn, code, start_date, log=lambda m: print(m),
+                                       latest=latest, force=args.force)
         except Exception as exc:
             good, message = False, "%s: %s" % (type(exc).__name__, str(exc)[:100])
         if good:

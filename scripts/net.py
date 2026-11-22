@@ -25,7 +25,7 @@ _OPENER = urllib.request.build_opener(
 )
 
 # 同花顺必须慢（实测无间隔连打会 502/504），其它源可以快一点
-_MIN_GAP = {"ths": 1.5, "kline": 1.5, "em": 0.35, "sse": 0.4, "szse": 0.5}
+_MIN_GAP = {"ths": 1.5, "kline": 1.5, "em": 0.35, "clist": 1.2, "sse": 0.4, "szse": 0.5}
 _last_hit = {}
 RETRY_WAITS = (1, 3, 7)
 
