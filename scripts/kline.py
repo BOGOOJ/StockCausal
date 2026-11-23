@@ -84,16 +84,19 @@ def decode_alljs(text):
     return rows
 
 
-def fetch_ths(code, segs):
-    """依次尝试多个 seg，返回 (行, 实际用的 seg)。"""
+def fetch_ths(code, segs, attempts=3):
+    """依次尝试多个 seg；同花顺 502 很频繁，整体再来两轮，间隔 5 秒。"""
     last_error = None
-    for seg in segs:
-        url = THS_URL % (code, seg)
-        try:
-            raw = net.fetch(url, referer=THS_REF % code, kind="kline", retries=3)
-            return decode_alljs(net.decode(raw, "utf-8")), seg
-        except Exception as exc:
-            last_error = exc
+    for attempt in range(attempts):
+        for seg in segs:
+            url = THS_URL % (code, seg)
+            try:
+                raw = net.fetch(url, referer=THS_REF % code, kind="kline", retries=2)
+                return decode_alljs(net.decode(raw, "utf-8")), seg
+            except Exception as exc:
+                last_error = exc
+        if attempt < attempts - 1:
+            time.sleep(5)
     raise net.NetError("%s 同花顺取数失败：%s" % (code, last_error))
 
 
@@ -157,7 +160,7 @@ def guard_today(rows):
     return rows
 
 
-def update_one(conn, raw_code, start_date, log=print, latest=None, force=False):
+def update_one(conn, raw_code, start_date, log=print, latest=None, force=False, need_adj=True):
     code = normalize(raw_code)
     if not re.fullmatch(r"[0-9A-Za-z]{4,8}", code):
         return False, "代码格式不对：%s" % raw_code
@@ -188,13 +191,13 @@ def update_one(conn, raw_code, start_date, log=print, latest=None, force=False):
 
     # 后复权收盘价：用来算真实涨跌幅（前复权老股会变负数，不能用）
     adj_map = {r["日期"]: r.get("收盘_后复权") for r in rows if r.get("收盘_后复权")}
-    if source == "同花顺" and not is_index(code):
+    if need_adj and source == "同花顺" and not is_index(code):
         try:
             adj_rows, _ = fetch_ths(code, ("02",))
             adj_map = {r["日期"]: r["收盘"] for r in adj_rows}
         except Exception:
             adj_map = {}
-    if not is_index(code) and not adj_map:
+    if need_adj and not is_index(code) and not adj_map:
         # 同花顺后复权取不到时用东财兜底：只补一列收盘价，请求量很小
         try:
             adj_rows = fetch_em.kline(fetch_em.secid(code), fqt=2)
@@ -279,6 +282,8 @@ def main(argv):
     parser.add_argument("--to", dest="date_to", default="", help="导出结束日期")
     parser.add_argument("--list", action="store_true", help="列出库里已有的代码")
     parser.add_argument("--force", action="store_true", help="已是最新也强制重下")
+    parser.add_argument("--no-adj", action="store_true",
+                        help="不取后复权（省一半请求；只做次日收益分析时够用）")
     args = parser.parse_args(argv)
 
     conn = connect()
@@ -330,7 +335,8 @@ def main(argv):
     for i, code in enumerate(targets, 1):
         try:
             good, message = update_one(conn, code, start_date, log=lambda m: print(m),
-                                       latest=latest, force=args.force)
+                                       latest=latest, force=args.force,
+                                       need_adj=not args.no_adj)
         except Exception as exc:
             good, message = False, "%s: %s" % (type(exc).__name__, str(exc)[:100])
         if good:

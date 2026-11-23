@@ -1,82 +1,38 @@
 # -*- coding: utf-8 -*-
-"""features.py —— 把「资金」算成可检验的指标。
+"""features.py —— 把资金数据算成指标（全市场版，走 SQLite 控内存）。
 
-口径（2026-11-20 与用户确认）：
+为什么要改成 SQLite：
+    4,800 只 × 251 天 ≈ 120 万行，再用 Python 字典装会吃掉几个 G。
+    本机可用内存只有 4.2G，所以中间数据全放磁盘，内存占用恒定。
 
-1. **事件型指标留 NULL，不填 0**
-   「今天没上榜」和「今天净买入额恰好是 0」是两件事，填 0 会把 98.6% 的样本挤进 0 档。
-   所以另外单独给一个 is_on_longhu 哑变量。
+输入：
+    data\\rzrq_stock.csv     融资余额、融资净买入
+    data\\longhu_stock.csv   龙虎榜净买额、当日成交额
+    data\\longhu_seat.csv    买卖前 5 营业部
+    data\\dzjy.csv           大宗交易溢价率
+    data\\industry_map.csv   行业与风格组
+    data\\kline.db           只用来取「哪些股票有哪些交易日」
 
-2. **跨股票比较用「当日横截面分位」，跟自己比用「z-score」**
-   这里只负责算出**原始值**；分位/z 化留给分析脚本（要用样本内数据算，避免未来泄漏）。
-
-3. **窗口**
-   T+1 主判定，T+1~T+3 只看持续性——由分析脚本负责。
-
-产出：
-    data\\features.csv          每行 = 一只股票一个交易日
-    data\\market_features.csv   每行 = 一个交易日（市场层）
+输出：
+    data\\features.db        表 feature（一行 = 一只股票一个交易日）
 
 用法：
-    python scripts\\features.py                 # 只算 watchlist 里的股票
-    python scripts\\features.py --all-codes     # 全市场（会慢，文件大）
+    python scripts\\features.py
+    python scripts\\features.py --rebuild     # 重建工作库（改了 CSV 后用）
 """
 import argparse
 import csv
 import os
 import sqlite3
 import sys
-from datetime import datetime
+import time
 
 import store
 
-KLINE_DB = os.path.join(store.DATA_DIR, "kline.db")
-FEATURE_CSV = os.path.join(store.DATA_DIR, "features.csv")
-MARKET_CSV = os.path.join(store.DATA_DIR, "market_features.csv")
-WATCHLIST = os.path.join(store.ROOT, "watchlist.txt")
-
-COLUMNS = [
-    "code", "date",
-    "margin_balance_yuan",      # 融资余额
-    "margin_growth_5",          # 融资余额 5 日增速
-    "margin_growth_20",         # 融资余额 20 日增速
-    "margin_net_intensity",     # 融资净买入 / 融资余额
-    "is_on_longhu",             # 当天是否上龙虎榜（0/1）
-    "lhb_net_ratio",            # 龙虎榜净买入额 / 当日成交额（仅上榜日为值）
-    "lhb_inst_buy_cnt",         # 买方前 5 里「机构专用」家数 0~5
-    "lhb_top5_buy_ratio",       # 买方前 5 买入额合计 / 当日成交额
-    "block_discount",           # 大宗平均溢价率 %
-    "block_amt_wan",            # 大宗成交额合计（万元）
-]
-
-
-def read_pool(all_codes=False):
-    codes = set()
-    with sqlite3.connect(KLINE_DB) as conn:
-        for (code,) in conn.execute("SELECT DISTINCT code FROM kline"):
-            codes.add(code)
-    if not all_codes and os.path.exists(WATCHLIST):
-        wanted = set()
-        with open(WATCHLIST, "r", encoding="utf-8-sig") as fh:
-            for line in fh:
-                line = line.split("#")[0].strip()
-                if line:
-                    wanted.add(line.split()[0])
-        codes = {c for c in codes if c in wanted}
-    return codes
-
-
-def iter_csv(dataset, wanted=None):
-    """流式读 CSV，wanted 给定时只留这些代码。"""
-    path = store.path_of(dataset)
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
-        for row in csv.DictReader(fh):
-            code = row.get("代码")
-            if wanted is not None and code not in wanted:
-                continue
-            yield row
+DATA = store.DATA_DIR
+WORK_DB = os.path.join(DATA, "work.db")
+FEATURE_DB = os.path.join(DATA, "features.db")
+KLINE_DB = os.path.join(DATA, "kline.db")
 
 
 def fnum(value):
@@ -88,189 +44,223 @@ def fnum(value):
         return None
 
 
-def load_kline(codes):
-    """(code, date) → 收盘、涨跌幅、成交额（成交额列可能还没补）。"""
-    out = {}
-    with sqlite3.connect(KLINE_DB) as conn:
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(kline)")}
-        has_amount = "amount" in cols
-        sql = "SELECT code,date,close,pct_chg%s FROM kline" % (",amount" if has_amount else "")
-        for row in conn.execute(sql):
-            code, date = row[0], row[1]
-            if code not in codes:
+def read_csv(path, wanted=None):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            if wanted is not None and row.get("代码") not in wanted:
                 continue
-            out[(code, date)] = {
-                "close": row[2],
-                "pct": row[3],
-                "amount_yuan": row[4] if has_amount else None,
-            }
-    return out
+            yield row
 
 
-def margin_features(codes):
-    """融资余额增速等。返回 {(code,date): {...}} 和 每只股票的日期序列。"""
-    series = {}
-    for row in iter_csv("rzrq_stock", codes):
-        code, date = row.get("代码"), row.get("交易日期")
-        balance = fnum(row.get("融资余额(元)"))
-        if not code or not date or not balance:
-            continue
-        series.setdefault(code, []).append((date, balance, fnum(row.get("融资净买入(元)"))))
+def load_industry():
+    path = os.path.join(DATA, "industry_map.csv")
     out = {}
-    for code, rows in series.items():
-        rows.sort()
-        for i, (date, balance, net) in enumerate(rows):
-            growth5 = balance / rows[i - 5][1] - 1 if i >= 5 and rows[i - 5][1] else None
-            growth20 = balance / rows[i - 20][1] - 1 if i >= 20 and rows[i - 20][1] else None
-            intensity = (net / balance) if (net is not None and balance) else None
-            out[(code, date)] = {
-                "margin_balance_yuan": balance,
-                "margin_growth_5": growth5,
-                "margin_growth_20": growth20,
-                "margin_net_intensity": intensity,
-            }
+    if not os.path.exists(path):
+        return out
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            out[row.get("代码")] = (row.get("一级") or "", row.get("风格组") or "")
     return out
 
 
-def longhu_features(codes):
-    """龙虎榜指标：只在上榜日有值，没上榜留 None（不填 0）。"""
-    base = {}
-    for row in iter_csv("longhu_stock", codes):
-        code, date = row.get("代码"), row.get("交易日期")
-        net_wan = fnum(row.get("龙虎榜净买入额(万元)"))
-        turnover_yi = fnum(row.get("成交金额(亿元)"))
-        if not code or not date:
-            continue
-        ratio = None
-        if net_wan is not None and turnover_yi:
-            ratio = net_wan / (turnover_yi * 10000.0)
-        base[(code, date)] = {
-            "is_on_longhu": 1,
-            "lhb_net_ratio": ratio,
-            "lhb_inst_buy_cnt": None,
-            "lhb_top5_buy_ratio": None,
-            "_turnover_yi": turnover_yi,
-        }
+def build_work(conn, codes):
+    """把四个大 CSV 塞进 SQLite 工作库（流式读，内存不涨）。"""
+    conn.executescript("""
+        DROP TABLE IF EXISTS margin_raw;
+        DROP TABLE IF EXISTS lhb_raw;
+        DROP TABLE IF EXISTS seat_raw;
+        DROP TABLE IF EXISTS block_raw;
+        CREATE TABLE margin_raw(code TEXT, date TEXT, balance REAL, net REAL);
+        CREATE TABLE lhb_raw(code TEXT, date TEXT, net_wan REAL, turnover_yi REAL);
+        CREATE TABLE seat_raw(code TEXT, date TEXT, direction TEXT, dept TEXT, buy_wan REAL);
+        CREATE TABLE block_raw(code TEXT, date TEXT, premium REAL, amt_wan REAL);
+    """)
 
-    seat_buy = {}
-    for row in iter_csv("longhu_seat", codes):
-        if row.get("方向") != "买入":
-            continue
-        key = (row.get("代码"), row.get("交易日期"))
-        amount = fnum(row.get("买入额(万元)"))
-        seat_buy.setdefault(key, {"sum": 0.0, "inst": 0})
-        if amount:
-            seat_buy[key]["sum"] += amount
-        if "机构专用" in (row.get("营业部") or ""):
-            seat_buy[key]["inst"] += 1
+    def batches(rows, sql, size=20000):
+        buf = []
+        for item in rows:
+            buf.append(item)
+            if len(buf) >= size:
+                conn.executemany(sql, buf)
+                buf = []
+        if buf:
+            conn.executemany(sql, buf)
 
-    for key, item in base.items():
-        seat = seat_buy.get(key)
-        if seat:
-            item["lhb_inst_buy_cnt"] = seat["inst"]
-            turnover_wan = (item["_turnover_yi"] or 0) * 10000.0
-            if turnover_wan > 0:
-                item["lhb_top5_buy_ratio"] = seat["sum"] / turnover_wan
-        item.pop("_turnover_yi", None)
-    return base
+    started = time.time()
+    batches(
+        ((r["代码"], r["交易日期"], fnum(r.get("融资余额(元)")), fnum(r.get("融资净买入(元)")))
+         for r in read_csv(os.path.join(DATA, "rzrq_stock.csv"), codes)
+         if r.get("代码") and r.get("交易日期") and fnum(r.get("融资余额(元)"))),
+        "INSERT INTO margin_raw VALUES(?,?,?,?)")
+    print("  融资 %d 行（%.0fs）" % (conn.execute("SELECT COUNT(*) FROM margin_raw").fetchone()[0],
+                                 time.time() - started))
 
+    batches(
+        ((r["代码"], r["交易日期"], fnum(r.get("龙虎榜净买入额(万元)")), fnum(r.get("成交金额(亿元)")))
+         for r in read_csv(os.path.join(DATA, "longhu_stock.csv"), codes)
+         if r.get("代码") and r.get("交易日期")),
+        "INSERT INTO lhb_raw VALUES(?,?,?,?)")
 
-def block_features(codes):
-    """大宗交易：平均溢价率与成交额。"""
-    agg = {}
-    for row in iter_csv("dzjy", codes):
-        key = (row.get("代码"), row.get("交易日期"))
-        prem = fnum(row.get("溢价率"))
-        amt = fnum(row.get("成交额(万元)"))
-        item = agg.setdefault(key, {"sum": 0.0, "n": 0, "amt": 0.0})
-        if prem is not None:
-            item["sum"] += prem
-            item["n"] += 1
-        if amt:
-            item["amt"] += amt
-    return {key: {
-        "block_discount": (v["sum"] / v["n"]) if v["n"] else None,
-        "block_amt_wan": round(v["amt"], 2) if v["amt"] else None,
-    } for key, v in agg.items()}
+    batches(
+        ((r["代码"], r["交易日期"], r.get("方向"), r.get("营业部"), fnum(r.get("买入额(万元)")))
+         for r in read_csv(os.path.join(DATA, "longhu_seat.csv"), codes)
+         if r.get("代码") and r.get("交易日期")),
+        "INSERT INTO seat_raw VALUES(?,?,?,?,?)")
+
+    batches(
+        ((r["代码"], r["交易日期"], fnum(r.get("溢价率")), fnum(r.get("成交额(万元)")))
+         for r in read_csv(os.path.join(DATA, "dzjy.csv"), codes)
+         if r.get("代码") and r.get("交易日期")),
+        "INSERT INTO block_raw VALUES(?,?,?,?)")
+
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_margin ON margin_raw(code, date);
+        CREATE INDEX IF NOT EXISTS idx_lhb ON lhb_raw(code, date);
+        CREATE INDEX IF NOT EXISTS idx_seat ON seat_raw(code, date);
+        CREATE INDEX IF NOT EXISTS idx_block ON block_raw(code, date);
+    """)
+    conn.commit()
 
 
-def market_features():
-    """市场层：ETF 总份额及其日变化。"""
-    totals = {}
-    for row in iter_csv("etf_share"):
-        date = row.get("交易日期")
-        share = fnum(row.get("总份额(万份)"))
-        if not date or share is None:
-            continue
-        totals[date] = totals.get(date, 0.0) + share
-    dates = sorted(totals)
-    out = []
-    for i, date in enumerate(dates):
-        prev = totals[dates[i - 1]] if i else None
-        out.append({
-            "date": date,
-            "etf_total_share": round(totals[date], 2),
-            "etf_share_chg": round(totals[date] - prev, 2) if prev is not None else None,
-        })
-    return out
+def build_features(conn, industry):
+    """一张 SQL 把指标算出来，避免 Python 逐行处理 120 万条。"""
+    conn.executescript("""
+        DROP TABLE IF EXISTS feature;
+        CREATE TABLE feature(
+            code TEXT, date TEXT,
+            sw1 TEXT, style TEXT,
+            margin_balance REAL, margin_growth_5 REAL, margin_growth_20 REAL,
+            margin_net_intensity REAL,
+            is_on_longhu INTEGER DEFAULT 0, lhb_net_ratio REAL,
+            lhb_inst_buy_cnt INTEGER, lhb_top5_buy_ratio REAL,
+            block_discount REAL, block_amt_wan REAL,
+            PRIMARY KEY(code, date)
+        );
+    """)
+
+    # 1) 融资指标：用窗口函数取 5 日 / 20 日前的余额
+    conn.executescript("""
+        INSERT INTO feature(code, date, margin_balance, margin_growth_5,
+                            margin_growth_20, margin_net_intensity)
+        SELECT code, date, balance,
+               CASE WHEN LAG(balance, 5) OVER w > 0
+                    THEN balance / LAG(balance, 5) OVER w - 1 END,
+               CASE WHEN LAG(balance, 20) OVER w > 0
+                    THEN balance / LAG(balance, 20) OVER w - 1 END,
+               CASE WHEN balance > 0 THEN net / balance END
+        FROM margin_raw
+        WINDOW w AS (PARTITION BY code ORDER BY date);
+    """)
+
+    # 2) 龙虎榜：净买占比 + 机构家数 + 买方前五集中度
+    conn.executescript("""
+        UPDATE feature SET
+            is_on_longhu = 1,
+            lhb_net_ratio = (SELECT CASE WHEN l.turnover_yi > 0
+                                         THEN l.net_wan / (l.turnover_yi * 10000.0) END
+                             FROM lhb_raw l
+                             WHERE l.code = feature.code AND l.date = feature.date
+                             LIMIT 1)
+        WHERE EXISTS (SELECT 1 FROM lhb_raw l
+                      WHERE l.code = feature.code AND l.date = feature.date);
+    """)
+    conn.executescript("""
+        UPDATE feature SET
+            lhb_inst_buy_cnt = (SELECT COUNT(*) FROM seat_raw s
+                                WHERE s.code = feature.code AND s.date = feature.date
+                                  AND s.direction = '买入' AND s.dept LIKE '%机构专用%'),
+            lhb_top5_buy_ratio = (
+                SELECT CASE WHEN l.turnover_yi > 0
+                            THEN (SELECT IFNULL(SUM(s.buy_wan), 0) FROM seat_raw s
+                                  WHERE s.code = feature.code AND s.date = feature.date
+                                    AND s.direction = '买入') / (l.turnover_yi * 10000.0)
+                       END
+                FROM lhb_raw l
+                WHERE l.code = feature.code AND l.date = feature.date
+                LIMIT 1)
+        WHERE is_on_longhu = 1;
+    """)
+
+    # 3) 大宗
+    conn.executescript("""
+        UPDATE feature SET
+            block_discount = (SELECT AVG(b.premium) FROM block_raw b
+                              WHERE b.code = feature.code AND b.date = feature.date),
+            block_amt_wan = (SELECT SUM(b.amt_wan) FROM block_raw b
+                             WHERE b.code = feature.code AND b.date = feature.date)
+        WHERE EXISTS (SELECT 1 FROM block_raw b
+                      WHERE b.code = feature.code AND b.date = feature.date);
+    """)
+
+    # 4) 补行业与风格组
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feat ON feature(code, date)")
+    for code, (sw1, style) in industry.items():
+        conn.execute("UPDATE feature SET sw1=?, style=? WHERE code=?", (sw1, style, code))
+    conn.commit()
 
 
 def main(argv):
-    parser = argparse.ArgumentParser(description="把资金数据算成特征")
-    parser.add_argument("--all-codes", action="store_true", help="全市场（慢、文件大）")
-    parser.add_argument("--quiet", action="store_true")
+    parser = argparse.ArgumentParser(description="算资金指标（全市场）")
+    parser.add_argument("--rebuild", action="store_true", help="重建工作库")
     args = parser.parse_args(argv)
 
     if not os.path.exists(KLINE_DB):
-        print("找不到 kline.db，先跑 kline.py --watchlist")
+        print("找不到 kline.db")
         return 2
-    codes = read_pool(args.all_codes)
-    if not codes:
-        print("没有可用代码")
-        return 2
-
-    margin = margin_features(codes)
-    lhb = longhu_features(codes)
-    block = block_features(codes)
-    kline = load_kline(codes)
-
-    keys = set(kline) | set(margin) | set(lhb)
-    rows = []
-    for key in sorted(keys):
-        code, date = key
-        record = {col: None for col in COLUMNS}
-        record["code"], record["date"] = code, date
-        record["is_on_longhu"] = 0
-        record.update(margin.get(key, {}))
-        record.update(lhb.get(key, {}))
-        record.update(block.get(key, {}))
-        rows.append(record)
-
     store.ensure_dirs()
-    with open(FEATURE_CSV, "w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=COLUMNS)
-        writer.writeheader()
-        for record in rows:
-            writer.writerow({col: ("" if record.get(col) is None else record[col]) for col in COLUMNS})
 
-    market = market_features()
-    with open(MARKET_CSV, "w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["date", "etf_total_share", "etf_share_chg"])
-        writer.writeheader()
-        writer.writerows(market)
+    with sqlite3.connect(KLINE_DB) as kc:
+        codes = {row[0] for row in kc.execute("SELECT DISTINCT code FROM kline")}
+    print("日线库里有 %d 个标的" % len(codes))
 
-    if not args.quiet:
-        filled_lhb = sum(1 for r in rows if r.get("lhb_net_ratio") is not None)
-        filled_margin = sum(1 for r in rows if r.get("margin_growth_5") is not None)
-        dates = sorted({r["date"] for r in rows})
-        print("特征表：%d 行，%d 只股票，%s ~ %s" % (len(rows), len(codes),
-                                              dates[0] if dates else "-", dates[-1] if dates else "-"))
-        print("  有龙虎榜净买占比的：%d 行（只在上榜日有值）" % filled_lhb)
-        print("  有融资余额5日增速的：%d 行" % filled_margin)
-        print("  市场层：%d 个交易日" % len(market))
-        print("  输出：%s" % FEATURE_CSV)
-        print("        %s" % MARKET_CSV)
-        print("  生成时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    industry = load_industry()
+    print("行业映射 %d 条（覆盖日线标的 %.1f%%）"
+          % (len(industry), 100.0 * len(codes & set(industry)) / max(len(codes), 1)))
+
+    conn = sqlite3.connect(WORK_DB)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=OFF")
+    if args.rebuild or conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='margin_raw'").fetchone()[0] == 0:
+        print("读取 CSV 建工作库……")
+        build_work(conn, codes)
+    else:
+        print("复用已有工作库（--rebuild 可重建）")
+
+    print("计算指标……")
+    started = time.time()
+    build_features(conn, {k: v for k, v in industry.items() if k in codes})
+    total = conn.execute("SELECT COUNT(*) FROM feature").fetchone()[0]
+    dates = conn.execute("SELECT MIN(date), MAX(date), COUNT(DISTINCT date) FROM feature").fetchone()
+    lhb = conn.execute("SELECT COUNT(*) FROM feature WHERE is_on_longhu=1").fetchone()[0]
+    withm = conn.execute("SELECT COUNT(*) FROM feature WHERE margin_growth_5 IS NOT NULL").fetchone()[0]
+    conn.commit()
+
+    # 把结果搬到独立的 features.db（工作库可以随时删）
+    with sqlite3.connect(FEATURE_DB) as fc:
+        fc.execute("DROP TABLE IF EXISTS feature")
+        fc.execute("""CREATE TABLE feature(
+            code TEXT, date TEXT, sw1 TEXT, style TEXT,
+            margin_balance REAL, margin_growth_5 REAL, margin_growth_20 REAL,
+            margin_net_intensity REAL, is_on_longhu INTEGER, lhb_net_ratio REAL,
+            lhb_inst_buy_cnt INTEGER, lhb_top5_buy_ratio REAL,
+            block_discount REAL, block_amt_wan REAL, PRIMARY KEY(code, date))""")
+        cursor = conn.execute("SELECT * FROM feature")
+        while True:
+            chunk = cursor.fetchmany(50000)
+            if not chunk:
+                break
+            fc.executemany("INSERT OR REPLACE INTO feature VALUES(%s)"
+                           % ",".join("?" * len(chunk[0])), chunk)
+        fc.commit()
+
+    print("完成（%.0fs）" % (time.time() - started))
+    print("  特征表 %d 行，日期 %s ~ %s（%d 天）" % (total, dates[0], dates[1], dates[2]))
+    print("  龙虎榜事件 %d 行；有融资5日增速 %d 行" % (lhb, withm))
+    print("  输出：%s（%.1f MB）" % (FEATURE_DB, os.path.getsize(FEATURE_DB) / 1024 / 1024))
+    conn.close()
     return 0
 
 
